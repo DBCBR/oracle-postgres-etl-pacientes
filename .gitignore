@@ -23,3 +23,8 @@ instantclient/
 
 # OS files
 .DS_Store
+
+# Instant Client distribution files kept in settings/ (local only)
+settings/**/instantclient_*/
+settings/**/instantclient*
+settings/linux/*.zip
