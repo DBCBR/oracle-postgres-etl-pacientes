@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  robo:
+    build: .
+    env_file:
+      - ./settings/.env
+    # Se a infra disponibilizar o Instant Client localmente, monte aqui
+    volumes:
+      - ./settings:/app/settings:ro
+      - ./logs:/app/logs
+      - ./instantclient:/opt/oracle/instantclient_23_0:ro
+    environment:
+      # Certifique-se que ORACLE_INSTANT_CLIENT aponta para o mount acima
+      - ORACLE_INSTANT_CLIENT=/opt/oracle/instantclient_23_0
+    restart: unless-stopped
+    command: ["python", "run_pipeline.py", "--daemon"]

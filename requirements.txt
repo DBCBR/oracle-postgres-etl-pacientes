@@ -1,0 +1,5 @@
+python-dotenv
+oracledb
+pandas
+psycopg2-binary
+argon2-cffi

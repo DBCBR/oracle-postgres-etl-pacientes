@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# SQLite DB
+fila_pacientes.db
+
+# Env files
+settings/.env
+.env
+
+# Logs
+logs/
+
+# Docker
+instantclient/
+*.log
+
+# OS files
+.DS_Store
