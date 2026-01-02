@@ -28,11 +28,13 @@ def insert_or_update_user(record: dict) -> bool:
         return True
 
     cols = [
+        "IdCadRegistration",
         "IdAdimission",
         "Patient",
         "UserPhone",
         "UserFullName",
         "UserEmail",
+        "RegistrationDate",
         "PatientType",
         "UserResponsibleLegal",
         "UserPasswordHash",
@@ -46,10 +48,15 @@ def insert_or_update_user(record: dict) -> bool:
 
     values = [record.get(c) for c in cols]
     placeholders = ", ".join(["%s"] * len(cols))
-    qualified_table = f"{PG_SCHEMA}.{PG_TABLE}" if PG_SCHEMA else PG_TABLE
-    update_assign = ", ".join([f"{c} = EXCLUDED.{c}" for c in cols if c != "IdAdimission"])
+    # Usar identificadores entre aspas para preservar o casing exato das colunas
+    quoted_cols = ", ".join([f'\"{c}\"' for c in cols])
+    if PG_SCHEMA:
+        qualified_table = f"{PG_SCHEMA}.\"{PG_TABLE}\""
+    else:
+        qualified_table = f"\"{PG_TABLE}\""
 
-    sql = f"INSERT INTO {qualified_table} ({', '.join(cols)}) VALUES ({placeholders}) ON CONFLICT (IdAdimission) DO UPDATE SET {update_assign};"
+    # Sempre inserir um novo registro. Não usar ON CONFLICT para permitir múltiplas linhas
+    sql = f"INSERT INTO {qualified_table} ({quoted_cols}) VALUES ({placeholders});"
 
     try:
         conn = _get_conn()

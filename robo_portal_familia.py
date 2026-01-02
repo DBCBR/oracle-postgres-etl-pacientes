@@ -1,0 +1,327 @@
+"""
+Robô único para o Portal Família.
+- Lê variáveis de ambiente em settings/.env
+- Inicializa Oracle Instant Client (modo thick)
+- Extrai registros da view Oracle
+- Normaliza/trata campos e gera hash/salt Argon2id para senha (CPF -> últimos 6 dígitos)
+- Insere sempre um novo registro na tabela Postgres UserRegistrationForm (sem updates)
+
+Requisitos: python-dotenv, oracledb, psycopg2-binary, argon2-cffi.
+"""
+
+import os
+import sys
+import base64
+import re
+import uuid
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+from argon2 import low_level, Type
+from dotenv import load_dotenv
+import oracledb
+import psycopg2
+
+# --------------------------------------------------------------------------------------
+# Configuração e carregamento de ambiente
+# --------------------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / "settings" / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+# Parâmetros Oracle
+ORACLE_HOST = os.getenv("ORACLE_HOST")
+ORACLE_PORT = os.getenv("ORACLE_PORT")
+ORACLE_SERVICE = os.getenv("ORACLE_SERVICE")
+ORACLE_SCHEMA = os.getenv("ORACLE_SCHEMA")
+ORACLE_VIEW = os.getenv("ORACLE_VIEW", "VWPACIENTES_COMVISITAS")
+ORACLE_USER = os.getenv("ORACLE_USER")
+ORACLE_PASS = os.getenv("ORACLE_PASS")
+ORACLE_CLIENT_WINDOWS = os.getenv("ORACLE_CLIENT_WINDOWS")
+ORACLE_CLIENT_LINUX = os.getenv("ORACLE_CLIENT_LINUX")
+ORACLE_INSTANT_CLIENT = os.getenv("ORACLE_INSTANT_CLIENT")
+
+# Parâmetros Postgres
+PG_HOST = os.getenv("PG_HOST")
+PG_PORT = os.getenv("PG_PORT")
+PG_DB = os.getenv("PG_DB")
+PG_SCHEMA = os.getenv("PG_SCHEMA", "public")
+PG_TABLE = os.getenv("PG_TABLE", "UserRegistrationForm")
+PG_USER = os.getenv("PG_USER")
+PG_PASS = os.getenv("PG_PASS")
+
+# Logging: erros vão para logs/errors.log, informações para stdout
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+logger = logging.getLogger("robo_portal_familia")
+logger.setLevel(logging.INFO)
+
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(fmt)
+
+error_handler = logging.FileHandler(LOG_DIR / "errors.log")
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(fmt)
+
+logger.handlers.clear()
+logger.addHandler(console_handler)
+logger.addHandler(error_handler)
+
+# --------------------------------------------------------------------------------------
+# Utilidades: caminho do Instant Client e inicialização do driver thick
+# --------------------------------------------------------------------------------------
+def resolve_instant_client_path() -> str:
+    """
+    Resolve o caminho do Instant Client.
+    - Usa ORACLE_CLIENT_WINDOWS/ORACLE_CLIENT_LINUX se definidos.
+    - Caso contrário, ORACLE_INSTANT_CLIENT ou fallback C:\\ClientOracle\\instantclient_23_0.
+    - Em Linux, tenta /opt/oracle/instantclient_23_0 como fallback clássico.
+    """
+    if os.name == "nt":
+        candidates = [ORACLE_CLIENT_WINDOWS, ORACLE_INSTANT_CLIENT, r"C:\\ClientOracle\\instantclient_23_0"]
+        probe = next((c for c in candidates if c), candidates[-1])
+        return probe
+    candidates = [ORACLE_CLIENT_LINUX, ORACLE_INSTANT_CLIENT, "/opt/oracle/instantclient_23_0"]
+    probe = next((c for c in candidates if c), candidates[-1])
+    return probe
+
+
+def init_oracle_client():
+    """
+    Inicializa o Oracle Client em modo thick, obrigatório para conexões com Instant Client.
+    """
+    lib_dir = resolve_instant_client_path()
+    try:
+        oracledb.init_oracle_client(lib_dir=lib_dir)
+        print(f"[ORACLE] Instant Client inicializado em: {lib_dir}")
+    except Exception as exc:
+        print(f"[ORACLE][ERRO] Falha ao iniciar Instant Client em {lib_dir}: {exc}")
+        print("Verifique se o diretório contém o Instant Client e se dependências (ex.: Visual C++ no Windows) estão instaladas.")
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------------------
+# Hash de senha (Argon2id) baseado no CPF
+# --------------------------------------------------------------------------------------
+PARALLELISM = 8
+MEMORY_COST = 65536
+TIME_COST = 4
+HASH_LENGTH = 32
+SALT_LENGTH = 16
+
+def gerar_senha_e_hash(cpf: str) -> Tuple[str, str]:
+    """
+    Gera hash Argon2id e salt base64.
+    - Senha base: últimos 6 dígitos do CPF (após remover pontuação). Se vazio, usa "000000".
+    - Retorna (hash_base64, salt_base64).
+    """
+    cpf_limpo = re.sub(r"[^0-9]", "", cpf or "")
+    senha = (cpf_limpo[-6:] or "000000")
+    salt_bytes = os.urandom(SALT_LENGTH)
+    hash_bytes = low_level.hash_secret_raw(
+        secret=senha.encode("utf-8"),
+        salt=salt_bytes,
+        time_cost=TIME_COST,
+        memory_cost=MEMORY_COST,
+        parallelism=PARALLELISM,
+        hash_len=HASH_LENGTH,
+        type=Type.ID,
+    )
+    return base64.b64encode(hash_bytes).decode("utf-8"), base64.b64encode(salt_bytes).decode("utf-8")
+
+
+# --------------------------------------------------------------------------------------
+# Conexões com bancos
+# --------------------------------------------------------------------------------------
+def oracle_connect():
+    """
+    Abre conexão Oracle em modo thick com parâmetros explícitos (host/port/service_name).
+    Evita dependência de DSN externo e mantém a chamada tão simples quanto a do Postgres.
+    """
+    return oracledb.connect(
+        user=ORACLE_USER,
+        password=ORACLE_PASS,
+        host=ORACLE_HOST,
+        port=int(ORACLE_PORT) if ORACLE_PORT else None,
+        service_name=ORACLE_SERVICE,
+    )
+
+
+def postgres_connect():
+    """
+    Abre conexão Postgres simples.
+    """
+    return psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASS)
+
+
+# --------------------------------------------------------------------------------------
+# Extração e transformação
+# --------------------------------------------------------------------------------------
+def fetch_oracle_rows() -> Iterable[Dict]:
+    """
+    Extrai todas as linhas da view Oracle configurada.
+    Retorna iterável de dicts com chaves em maiúsculas.
+    """
+    full_view = f"{ORACLE_SCHEMA}.{ORACLE_VIEW}" if ORACLE_SCHEMA else ORACLE_VIEW
+    sql = f"SELECT * FROM {full_view}"
+    with oracle_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0].upper() for d in cur.description]
+            while True:
+                rows = cur.fetchmany(500)
+                if not rows:
+                    break
+                for row in rows:
+                    yield {cols[i]: row[i] for i in range(len(cols))}
+
+
+def transformar_registro(raw: Dict) -> Dict:
+    """
+    Normaliza campos e monta o payload final para o Postgres.
+    - Limpa strings (strip), substitui None por "" quando apropriado.
+    - Deriva PatientType do campo TIPOVISITA (antes do '-').
+    - Gera hash/salt Argon2id a partir do CPF.
+    """
+    # Limpeza básica de strings para reduzir espaços e nulos
+    cleaned = {}
+    for k, v in raw.items():
+        if isinstance(v, str):
+            cleaned[k] = v.strip()
+        else:
+            cleaned[k] = v
+
+    def first_of(*keys):
+        for k in keys:
+            if cleaned.get(k) not in (None, ""):
+                return cleaned.get(k)
+        return None
+
+    cpf = (first_of("CPF", "NRO_CPF", "NR_CPF") or "")
+    email = first_of("EMAIL") or (f"{cpf}@naoinformado.com" if cpf else None)
+    telefones = first_of("TELEFONES", "TELEFONE", "FONE", "CELULAR") or ""
+    nome_paciente = first_of("NOME_PACIENTE", "NOME")
+    pessoa_contato = first_of("PESSOACONTATO", "VINCULO") or ""
+    dt_nasc = first_of("DTNASCTO", "DATA_NASCIMENTO")
+    tipo_visita = first_of("TIPOVISITA", "ESPECIALIDADE", "TIPO_PACIENTE") or ""
+    patient_type = tipo_visita.split("-")[0].strip() if "-" in tipo_visita else tipo_visita
+
+    hash_str, salt_str = gerar_senha_e_hash(cpf)
+
+    record = {
+        "IdCadRegistration": str(uuid.uuid4()),
+        "IdAdimission": first_of("ID_ATENDIMENTO", "IDATENDIMENTO"),
+        "Patient": nome_paciente,
+        "UserPhone": telefones,
+        "UserFullName": nome_paciente,
+        "UserEmail": email,
+        "RegistrationDate": datetime.now(),
+        "PatientType": patient_type,
+        "UserResponsibleLegal": bool(pessoa_contato),
+        "UserPasswordHash": hash_str,
+        "UserPasswordSalt": salt_str,
+        "UserBondWithPatient": pessoa_contato,
+        "UserDateOfBirth": dt_nasc,
+        "UserCpf": cpf,
+        "Status": True,
+        "IsAdmin": False,
+    }
+    return record
+
+
+# --------------------------------------------------------------------------------------
+# Carga no Postgres
+# --------------------------------------------------------------------------------------
+COLS = [
+    "IdCadRegistration",
+    "IdAdimission",
+    "Patient",
+    "UserPhone",
+    "UserFullName",
+    "UserEmail",
+    "RegistrationDate",
+    "PatientType",
+    "UserResponsibleLegal",
+    "UserPasswordHash",
+    "UserPasswordSalt",
+    "UserBondWithPatient",
+    "UserDateOfBirth",
+    "UserCpf",
+    "Status",
+    "IsAdmin",
+]
+
+
+def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
+    """
+    Insere registros no Postgres SEM atualizar existentes.
+    - Em caso de falha individual, registra no logger de erros e segue para o próximo.
+    - Retorna (sucessos, falhas).
+    """
+    if not records:
+        logger.info("[PG] Nada a inserir.")
+        return 0, 0
+
+    placeholders = ", ".join(["%s"] * len(COLS))
+    quoted_cols = ", ".join([f'"{c}"' for c in COLS])
+    if PG_SCHEMA:
+        table_name = f"{PG_SCHEMA}.\"{PG_TABLE}\""
+    else:
+        table_name = f'"{PG_TABLE}"'
+
+    sql = f"INSERT INTO {table_name} ({quoted_cols}) VALUES ({placeholders});"
+
+    sucessos = 0
+    falhas = 0
+
+    with postgres_connect() as conn:
+        conn.autocommit = True  # cada insert é independente
+        with conn.cursor() as cur:
+            for rec in records:
+                values = [rec.get(c) for c in COLS]
+                try:
+                    cur.execute(sql, values)
+                    sucessos += 1
+                except Exception as exc:
+                    falhas += 1
+                    logger.error("Falha ao inserir IdAdimission=%s: %s", rec.get("IdAdimission"), exc)
+
+    logger.info("[PG] Inseridos com sucesso: %s | Falhas: %s", sucessos, falhas)
+    return sucessos, falhas
+
+
+# --------------------------------------------------------------------------------------
+# Pipeline principal
+# --------------------------------------------------------------------------------------
+def run_pipeline():
+    """
+    Executa o fluxo completo uma vez:
+    1) Inicializa Instant Client
+    2) Lê todos os registros da view Oracle
+    3) Transforma e gera hash/salt
+    4) Insere no Postgres (sempre novas linhas)
+    """
+    init_oracle_client()
+    registros = []
+    total_lidos = 0
+    for row in fetch_oracle_rows():
+        total_lidos += 1
+        try:
+            registros.append(transformar_registro(row))
+        except Exception as exc:
+            logger.error("Falha ao transformar registro ID_ATENDIMENTO=%s: %s", row.get("ID_ATENDIMENTO"), exc)
+    sucessos, falhas = inserir_postgres(registros)
+    logger.info("[RESUMO] Lidos do Oracle: %s | Inseridos com sucesso: %s | Falhas: %s", total_lidos, sucessos, falhas)
+    logger.info("[INFO] Pipeline concluído.")
+
+
+# --------------------------------------------------------------------------------------
+# Entrada principal
+# --------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    run_pipeline()
