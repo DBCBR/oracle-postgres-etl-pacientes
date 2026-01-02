@@ -5,6 +5,7 @@ Robô único para o Portal Família.
 - Extrai registros da view Oracle
 - Normaliza/trata campos e gera hash/salt Argon2id para senha (CPF -> últimos 6 dígitos)
 - Insere sempre um novo registro na tabela Postgres UserRegistrationForm (sem updates)
+- IMPLEMENTADO: Filtro de duplicidade por chave composta (IdAdimission + PatientType)
 
 Requisitos: python-dotenv, oracledb, psycopg2-binary, argon2-cffi.
 """
@@ -53,7 +54,7 @@ PG_TABLE = os.getenv("PG_TABLE", "UserRegistrationForm")
 PG_USER = os.getenv("PG_USER")
 PG_PASS = os.getenv("PG_PASS")
 
-# Logging: info resumida no console e logs/info.log, erros detalhados em logs/errors.log
+# Logging
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 logger = logging.getLogger("robo_portal_familia")
@@ -79,15 +80,9 @@ logger.addHandler(info_handler)
 logger.addHandler(error_handler)
 
 # --------------------------------------------------------------------------------------
-# Utilidades: caminho do Instant Client e inicialização do driver thick
+# Utilidades
 # --------------------------------------------------------------------------------------
 def resolve_instant_client_path() -> str:
-    """
-    Resolve o caminho do Instant Client.
-    - Usa ORACLE_CLIENT_WINDOWS/ORACLE_CLIENT_LINUX se definidos.
-    - Caso contrário, ORACLE_INSTANT_CLIENT ou fallback C:\\ClientOracle\\instantclient_23_0.
-    - Em Linux, tenta /opt/oracle/instantclient_23_0 como fallback clássico.
-    """
     if os.name == "nt":
         candidates = [ORACLE_CLIENT_WINDOWS, ORACLE_INSTANT_CLIENT, r"C:\\ClientOracle\\instantclient_23_0"]
         probe = next((c for c in candidates if c), candidates[-1])
@@ -98,21 +93,17 @@ def resolve_instant_client_path() -> str:
 
 
 def init_oracle_client():
-    """
-    Inicializa o Oracle Client em modo thick, obrigatório para conexões com Instant Client.
-    """
     lib_dir = resolve_instant_client_path()
     try:
         oracledb.init_oracle_client(lib_dir=lib_dir)
         print(f"[ORACLE] Instant Client inicializado em: {lib_dir}")
     except Exception as exc:
         print(f"[ORACLE][ERRO] Falha ao iniciar Instant Client em {lib_dir}: {exc}")
-        print("Verifique se o diretório contém o Instant Client e se dependências (ex.: Visual C++ no Windows) estão instaladas.")
         sys.exit(1)
 
 
 # --------------------------------------------------------------------------------------
-# Hash de senha (Argon2id) baseado no CPF
+# Hash de senha (Argon2id)
 # --------------------------------------------------------------------------------------
 PARALLELISM = 8
 MEMORY_COST = 65536
@@ -121,11 +112,6 @@ HASH_LENGTH = 32
 SALT_LENGTH = 16
 
 def gerar_senha_e_hash(cpf: str) -> Tuple[str, str]:
-    """
-    Gera hash Argon2id e salt base64.
-    - Senha base: últimos 6 dígitos do CPF (após remover pontuação). Se vazio, usa "000000".
-    - Retorna (hash_base64, salt_base64).
-    """
     cpf_limpo = re.sub(r"[^0-9]", "", cpf or "")
     senha = (cpf_limpo[-6:] or "000000")
     salt_bytes = os.urandom(SALT_LENGTH)
@@ -142,12 +128,9 @@ def gerar_senha_e_hash(cpf: str) -> Tuple[str, str]:
 
 
 # --------------------------------------------------------------------------------------
-# Conexões com bancos
+# Conexões
 # --------------------------------------------------------------------------------------
 def oracle_connect():
-    """
-    Abre conexão Oracle em modo thick com parâmetros explícitos (host/port/service_name).
-    """
     return oracledb.connect(
         user=ORACLE_USER,
         password=ORACLE_PASS,
@@ -158,9 +141,6 @@ def oracle_connect():
 
 
 def postgres_connect():
-    """
-    Abre conexão Postgres simples.
-    """
     return psycopg2.connect(
         host=PG_HOST, 
         port=PG_PORT, 
@@ -170,27 +150,28 @@ def postgres_connect():
     )
 
 
-def buscar_ids_recentes_postgres(janela_minutos: int) -> Set[str]:
+def buscar_chaves_existentes_postgres() -> Set[Tuple[str, str]]:
     """
-    Obtém todos os IdAdimission que foram inseridos nos últimos 'janela_minutos' minutos,
-    baseado na coluna RegistrationDate.
-    Serve para evitar reinserir o mesmo registro imediatamente em ciclos seguidos.
+    Obtém um conjunto de tuplas (IdAdimission, PatientType) que JÁ existem no Postgres.
+    Isso permite diferenciar '100 - Medico' de '100 - Enfermeiro'.
     """
-    if janela_minutos <= 0:
-        return set()
     try:
         if PG_SCHEMA:
             table_name = f"{PG_SCHEMA}.\"{PG_TABLE}\""
         else:
             table_name = f'"{PG_TABLE}"'
-        cutoff = datetime.now() - timedelta(minutes=janela_minutos)
-        sql = f"SELECT \"IdAdimission\" FROM {table_name} WHERE \"RegistrationDate\" >= %s;"
+        
+        # Selecionamos as colunas que formam a nossa "chave composta lógica"
+        sql = f"SELECT \"IdAdimission\", \"PatientType\" FROM {table_name};"
+        
         with postgres_connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (cutoff,))
-                return {str(row[0]) for row in cur.fetchall() if row[0] is not None}
+                cur.execute(sql)
+                # Retorna um SET de tuplas para busca rápida O(1)
+                # row[0] = IdAdimission, row[1] = PatientType
+                return {(str(row[0]), str(row[1])) for row in cur.fetchall() if row[0] is not None}
     except Exception as exc:
-        logger.error("Falha ao buscar IdAdimission recentes no Postgres: %s", exc)
+        logger.error("Falha ao buscar chaves existentes no Postgres: %s", exc)
         return set()
 
 
@@ -198,10 +179,6 @@ def buscar_ids_recentes_postgres(janela_minutos: int) -> Set[str]:
 # Extração e transformação
 # --------------------------------------------------------------------------------------
 def fetch_oracle_rows() -> Iterable[Dict]:
-    """
-    Extrai todas as linhas da view Oracle configurada.
-    Retorna iterável de dicts com chaves em maiúsculas.
-    """
     full_view = f"{ORACLE_SCHEMA}.{ORACLE_VIEW}" if ORACLE_SCHEMA else ORACLE_VIEW
     sql = f"SELECT * FROM {full_view}"
     with oracle_connect() as conn:
@@ -218,12 +195,9 @@ def fetch_oracle_rows() -> Iterable[Dict]:
 
 def transformar_registro(raw: Dict) -> Dict:
     """
-    Normaliza campos e monta o payload final para o Postgres.
-    - Limpa strings (strip), substitui None por "" quando apropriado.
-    - Deriva PatientType do campo TIPOVISITA (antes do '-').
-    - Gera hash/salt Argon2id a partir do CPF.
+    Normaliza campos e monta o payload.
+    ALTERAÇÃO: Concatena Especialidade/Profissional ao PatientType para unicidade.
     """
-    # Limpeza básica de strings para reduzir espaços e nulos
     cleaned = {}
     for k, v in raw.items():
         if isinstance(v, str):
@@ -244,7 +218,17 @@ def transformar_registro(raw: Dict) -> Dict:
     pessoa_contato = first_of("PESSOACONTATO", "VINCULO") or ""
     dt_nasc = first_of("DTNASCTO", "DATA_NASCIMENTO")
     tipo_visita = first_of("TIPOVISITA", "ESPECIALIDADE", "TIPO_PACIENTE") or ""
-    patient_type = tipo_visita.split("-")[0].strip() if "-" in tipo_visita else tipo_visita
+    
+    # --- Lógica de Diferenciação ---
+    # Extrai o tipo base (ex: "ID", "AD")
+    tipo_base = tipo_visita.split("-")[0].strip() if "-" in tipo_visita else tipo_visita
+    # Extrai a especialidade ou profissional (ex: "Medico", "Enfermeiro")
+    especialidade = first_of("ESPECIALIDADE", "PROFISSIONAL", "CARGO") or "Geral"
+    
+    # Cria o Tipo Composto (ex: "ID - Medico")
+    # Isso será salvo no Postgres para diferenciar os registros
+    patient_type_composto = f"{tipo_base} - {especialidade}"
+    # -------------------------------
 
     hash_str, salt_str = gerar_senha_e_hash(cpf)
 
@@ -256,7 +240,7 @@ def transformar_registro(raw: Dict) -> Dict:
         "UserFullName": nome_paciente,
         "UserEmail": email,
         "RegistrationDate": datetime.now(),
-        "PatientType": patient_type,
+        "PatientType": patient_type_composto, # Usando o tipo composto
         "UserResponsibleLegal": bool(pessoa_contato),
         "UserPasswordHash": hash_str,
         "UserPasswordSalt": salt_str,
@@ -293,11 +277,6 @@ COLS = [
 
 
 def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
-    """
-    Insere registros no Postgres SEM atualizar existentes.
-    - Em caso de falha individual, registra no logger de erros e segue para o próximo.
-    - Retorna (sucessos, falhas).
-    """
     if not records:
         return 0, 0
 
@@ -314,7 +293,7 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
     falhas = 0
 
     with postgres_connect() as conn:
-        conn.autocommit = True  # cada insert é independente
+        conn.autocommit = True
         with conn.cursor() as cur:
             for rec in records:
                 values = [rec.get(c) for c in COLS]
@@ -323,7 +302,8 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
                     sucessos += 1
                 except Exception as exc:
                     falhas += 1
-                    logger.error("Falha ao inserir registro - IdAdimission=%s | Erro: %s", rec.get("IdAdimission"), exc)
+                    logger.error("Falha ao inserir - IdAdimission=%s | Tipo=%s | Erro: %s", 
+                                 rec.get("IdAdimission"), rec.get("PatientType"), exc)
 
     return sucessos, falhas
 
@@ -331,49 +311,78 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
 # --------------------------------------------------------------------------------------
 # Pipeline principal
 # --------------------------------------------------------------------------------------
-def processar_batch(dedupe_window: int = 0) -> Tuple[int, int, int]:
+def processar_batch() -> Tuple[int, int, int]:
     """
-    Executa um ciclo de leitura Oracle -> transformação -> inserção no Postgres.
-    - dedupe_window: se > 0, ignora IdAdimission inseridos nos últimos N minutos (evita duplicatas imediatas).
-    Retorna (lidos_oracle, sucessos_pg, falhas_pg).
+    Fluxo otimizado:
+    1. Busca histórico (ID + PatientType) do Postgres.
+    2. Lê Oracle.
+    3. Filtra o que já existe no histórico.
+    4. Insere somente novos.
     """
-    registros = []
-    total_lidos = 0
+    # 1. Carrega histórico existente para evitar duplicidade de processamento
+    chaves_existentes = buscar_chaves_existentes_postgres()
+    logger.info(f"Registros já persistidos no Postgres (Histórico): {len(chaves_existentes)}")
+
+    registros_novos = []
+    total_lidos_oracle = 0
+    ignorados_historico = 0
+    ignorados_batch_atual = 0
+    
+    # Controle local para não duplicar registros iguais vindos na mesma consulta do Oracle
+    chaves_vistas_agora = set()
+
     for row in fetch_oracle_rows():
-        total_lidos += 1
+        total_lidos_oracle += 1
         try:
-            registros.append(transformar_registro(row))
+            # Transformamos antes para ter acesso ao PatientType composto
+            reg = transformar_registro(row)
+            
+            id_adm = str(reg.get("IdAdimission"))
+            p_type = str(reg.get("PatientType"))
+            
+            # A chave de unicidade é a combinação do Atendimento com o Tipo/Profissional
+            chave_unica = (id_adm, p_type)
+
+            # VERIFICAÇÃO 1: Já está no banco?
+            if chave_unica in chaves_existentes:
+                ignorados_historico += 1
+                continue
+            
+            # VERIFICAÇÃO 2: Já processei neste ciclo? (Oracle pode retornar linhas repetidas)
+            if chave_unica in chaves_vistas_agora:
+                ignorados_batch_atual += 1
+                continue
+
+            # Se é novo, adiciona à lista e marca como visto
+            chaves_vistas_agora.add(chave_unica)
+            registros_novos.append(reg)
+
         except Exception as exc:
-            logger.error("Falha ao transformar registro ID_ATENDIMENTO=%s: %s", row.get("ID_ATENDIMENTO"), exc)
+            logger.error("Falha ao transformar/processar registro: %s", exc)
 
-    if dedupe_window > 0:
-        recentes = buscar_ids_recentes_postgres(dedupe_window)
-        antes = len(registros)
-        registros = [r for r in registros if str(r.get("IdAdimission")) not in recentes]
-        removidos = antes - len(registros)
-        if removidos:
-            logger.info("Ignorados %s registros já inseridos recentemente (janela: %s min)", removidos, dedupe_window)
+    logger.info(
+        f"Lidos Oracle: {total_lidos_oracle} | "
+        f"Ignorados (Já no Banco): {ignorados_historico} | "
+        f"Ignorados (Duplicados na View): {ignorados_batch_atual} | "
+        f"Novos a inserir: {len(registros_novos)}"
+    )
 
-    sucessos, falhas = inserir_postgres(registros)
-    return total_lidos, sucessos, falhas
+    sucessos, falhas = inserir_postgres(registros_novos)
+    return total_lidos_oracle, sucessos, falhas
 
 
-def run_pipeline(watch_interval: int = None, dedupe_window: int = 0):
-    """
-    Executa o fluxo completo.
-    - watch_interval=None: roda uma vez e encerra.
-    - watch_interval>0: roda em loop, aguardando 'watch_interval' segundos entre ciclos.
-    - dedupe_window: janela em minutos para evitar reinserir IdAdimission recentes.
-    """
+def run_pipeline(watch_interval: int = None):
     init_oracle_client()
     ciclo = 0
     while True:
         ciclo += 1
         logger.info("--- Ciclo %s iniciado ---", ciclo)
-        lidos, ok, falha = processar_batch(dedupe_window=dedupe_window)
-        logger.info("Registros encontrados: %s | Inseridos: %s | Falhas: %s", lidos, ok, falha)
+        lidos, ok, falha = processar_batch()
+        logger.info("Ciclo finalizado. Encontrados: %s | Inseridos: %s | Falhas: %s", lidos, ok, falha)
+        
         if not watch_interval:
             break
+        
         logger.info("Próximo ciclo em %s segundos", watch_interval)
         time.sleep(watch_interval)
     logger.info("Pipeline concluído")
@@ -384,13 +393,11 @@ def run_pipeline(watch_interval: int = None, dedupe_window: int = 0):
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     # Configuração autônoma: executa a cada 1 hora (3600 segundos)
-    # com janela de deduplicação de 1 hora (60 minutos)
     WATCH_INTERVAL_SECONDS = 3600  # 1 hora
-    DEDUPE_WINDOW_MINUTES = 60     # 1 hora
     
     logger.info("="*60)
-    logger.info("Robô Portal Família - Iniciando modo autônomo")
-    logger.info("Intervalo entre ciclos: 1 hora | Janela de deduplicação: 1 hora")
+    logger.info("Robô Portal Família - Modo Incremental Inteligente")
+    logger.info("Intervalo: 1 hora | Validação: IdAdimission + PatientType")
     logger.info("="*60)
     
-    run_pipeline(watch_interval=WATCH_INTERVAL_SECONDS, dedupe_window=DEDUPE_WINDOW_MINUTES)
+    run_pipeline(watch_interval=WATCH_INTERVAL_SECONDS)

@@ -29,9 +29,8 @@ Para cada paciente encontrado, o robô:
 - Se faltar algum dado (como email), ele inventa um padrão (CPF@naoinformado.com)
 
 #### 4. Verificação de Duplicatas (Evitar Repetição)
-- Antes de inserir, o robô verifica no Postgres quais pacientes já foram cadastrados na última hora
-- Ele ignora esses pacientes para não criar registros duplicados desnecessariamente
-- Mas se o mesmo paciente aparecer depois de 1 hora, ele insere novamente (porque pode ser uma nova consulta)
+- Antes de inserir, o robô verifica no Postgres quais combinações **Atendimento + Tipo/Profissional** já existem.
+- Se a mesma combinação já existe, ele ignora; se for um novo tipo ou profissional para o mesmo atendimento, ele insere.
 
 #### 5. Inserção no Postgres (Gravação)
 - Para cada paciente novo, o robô insere uma linha completa na tabela do Postgres
@@ -98,7 +97,7 @@ transformar_registro(raw: Dict) → Dict
 **Operações de transformação:**
 - String normalization: `strip()` em todos os campos texto
 - Field mapping com fallback chain (ex: CPF → NRO_CPF → NR_CPF)
-- Derivação de `PatientType` via split de `TIPOVISITA` (extrai sigla antes do '-')
+- Derivação de `PatientType` **composto**: tipo base (prefixo de TIPOVISITA) + especialidade/profissional (ex.: `ID - Medico`)
 - Email fallback: `{CPF}@naoinformado.com` se ausente
 - Geração UUID v4 para `IdCadRegistration`
 - Timestamp `RegistrationDate` com `datetime.now()`
@@ -114,16 +113,15 @@ gerar_senha_e_hash(cpf: str) → Tuple[str, str]
 - Salt: 16 bytes aleatórios via `os.urandom()`
 - Output: (hash_base64, salt_base64)
 
-#### 5. Deduplicação Temporal
+#### 5. Deduplicação por Chave Composta
 
 ```python
-buscar_ids_recentes_postgres(janela_minutos: int) → Set[str]
+buscar_chaves_existentes_postgres() → Set[(IdAdimission, PatientType)]
 ```
 
-- Query: `SELECT "IdAdimission" FROM {table} WHERE "RegistrationDate" >= %s`
-- Cutoff: `datetime.now() - timedelta(minutes=janela_minutos)`
-- Filtro em memória: `registros = [r for r in registros if str(r.get("IdAdimission")) not in recentes]`
-- Complexidade: O(n) com set lookup O(1)
+- Query: `SELECT "IdAdimission", "PatientType" FROM {table}`
+- Filtro em memória: ignora se `(IdAdimission, PatientType)` já existe no Postgres ou já apareceu no mesmo batch (view retornando duplicadas)
+- Objetivo: permitir múltiplos registros para o mesmo atendimento, desde que com tipo/profissional distinto
 
 #### 6. ETL Pipeline - Load
 
@@ -140,14 +138,13 @@ inserir_postgres(records: List[Dict]) → Tuple[int, int]
 #### 7. Orquestração e Scheduling
 
 ```python
-run_pipeline(watch_interval: int, dedupe_window: int)
+run_pipeline(watch_interval: int)
 ```
 
 - Loop infinito: `while True`
 - Interval: 3600s (1 hora)
-- Dedupe window: 60 minutos
 - Execução sequencial por ciclo:
-  1. `processar_batch()` → (lidos, sucessos, falhas)
+  1. `processar_batch()` → lê Oracle, filtra por chave composta e insere
   2. Logging de resumo
   3. `time.sleep(watch_interval)`
 
@@ -273,4 +270,4 @@ Projeto interno - DBC Company
 
 ---
 
-**Resumo Executivo:** Sistema ETL autônomo com polling horário, normalização de dados, hashing criptográfico de senhas, deduplicação temporal e logging estruturado, operando como daemon para sincronização unidirecional Oracle→Postgres.
+**Resumo Executivo:** Sistema ETL autônomo com polling horário, normalização de dados, hashing criptográfico de senhas e deduplicação por chave composta (Atendimento + Tipo/Profissional), operando como daemon para sincronização unidirecional Oracle→Postgres.
