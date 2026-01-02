@@ -11,13 +11,14 @@ Requisitos: python-dotenv, oracledb, psycopg2-binary, argon2-cffi.
 
 import os
 import sys
+import time
 import base64
 import re
 import uuid
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Set
 
 from argon2 import low_level, Type
 from dotenv import load_dotenv
@@ -52,7 +53,7 @@ PG_TABLE = os.getenv("PG_TABLE", "UserRegistrationForm")
 PG_USER = os.getenv("PG_USER")
 PG_PASS = os.getenv("PG_PASS")
 
-# Logging: erros vão para logs/errors.log, informações para stdout
+# Logging: info resumida no console e logs/info.log, erros detalhados em logs/errors.log
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 logger = logging.getLogger("robo_portal_familia")
@@ -64,12 +65,17 @@ console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(fmt)
 
+info_handler = logging.FileHandler(LOG_DIR / "info.log")
+info_handler.setLevel(logging.INFO)
+info_handler.setFormatter(fmt)
+
 error_handler = logging.FileHandler(LOG_DIR / "errors.log")
 error_handler.setLevel(logging.ERROR)
 error_handler.setFormatter(fmt)
 
 logger.handlers.clear()
 logger.addHandler(console_handler)
+logger.addHandler(info_handler)
 logger.addHandler(error_handler)
 
 # --------------------------------------------------------------------------------------
@@ -157,6 +163,30 @@ def postgres_connect():
     Abre conexão Postgres simples.
     """
     return psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASS)
+
+
+def buscar_ids_recentes_postgres(janela_minutos: int) -> Set[str]:
+    """
+    Obtém todos os IdAdimission que foram inseridos nos últimos 'janela_minutos' minutos,
+    baseado na coluna RegistrationDate.
+    Serve para evitar reinserir o mesmo registro imediatamente em ciclos seguidos.
+    """
+    if janela_minutos <= 0:
+        return set()
+    try:
+        if PG_SCHEMA:
+            table_name = f"{PG_SCHEMA}.\"{PG_TABLE}\""
+        else:
+            table_name = f'"{PG_TABLE}"'
+        cutoff = datetime.now() - timedelta(minutes=janela_minutos)
+        sql = f"SELECT \"IdAdimission\" FROM {table_name} WHERE \"RegistrationDate\" >= %s;"
+        with postgres_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (cutoff,))
+                return {str(row[0]) for row in cur.fetchall() if row[0] is not None}
+    except Exception as exc:
+        logger.error("Falha ao buscar IdAdimission recentes no Postgres: %s", exc)
+        return set()
 
 
 # --------------------------------------------------------------------------------------
@@ -264,7 +294,6 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
     - Retorna (sucessos, falhas).
     """
     if not records:
-        logger.info("[PG] Nada a inserir.")
         return 0, 0
 
     placeholders = ", ".join(["%s"] * len(COLS))
@@ -289,24 +318,20 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
                     sucessos += 1
                 except Exception as exc:
                     falhas += 1
-                    logger.error("Falha ao inserir IdAdimission=%s: %s", rec.get("IdAdimission"), exc)
+                    logger.error("Falha ao inserir registro - IdAdimission=%s | Erro: %s", rec.get("IdAdimission"), exc)
 
-    logger.info("[PG] Inseridos com sucesso: %s | Falhas: %s", sucessos, falhas)
     return sucessos, falhas
 
 
 # --------------------------------------------------------------------------------------
 # Pipeline principal
 # --------------------------------------------------------------------------------------
-def run_pipeline():
+def processar_batch(dedupe_window: int = 0) -> Tuple[int, int, int]:
     """
-    Executa o fluxo completo uma vez:
-    1) Inicializa Instant Client
-    2) Lê todos os registros da view Oracle
-    3) Transforma e gera hash/salt
-    4) Insere no Postgres (sempre novas linhas)
+    Executa um ciclo de leitura Oracle -> transformação -> inserção no Postgres.
+    - dedupe_window: se > 0, ignora IdAdimission inseridos nos últimos N minutos (evita duplicatas imediatas).
+    Retorna (lidos_oracle, sucessos_pg, falhas_pg).
     """
-    init_oracle_client()
     registros = []
     total_lidos = 0
     for row in fetch_oracle_rows():
@@ -315,13 +340,52 @@ def run_pipeline():
             registros.append(transformar_registro(row))
         except Exception as exc:
             logger.error("Falha ao transformar registro ID_ATENDIMENTO=%s: %s", row.get("ID_ATENDIMENTO"), exc)
+
+    if dedupe_window > 0:
+        recentes = buscar_ids_recentes_postgres(dedupe_window)
+        antes = len(registros)
+        registros = [r for r in registros if str(r.get("IdAdimission")) not in recentes]
+        removidos = antes - len(registros)
+        if removidos:
+            logger.info("Ignorados %s registros já inseridos recentemente (janela: %s min)", removidos, dedupe_window)
+
     sucessos, falhas = inserir_postgres(registros)
-    logger.info("[RESUMO] Lidos do Oracle: %s | Inseridos com sucesso: %s | Falhas: %s", total_lidos, sucessos, falhas)
-    logger.info("[INFO] Pipeline concluído.")
+    return total_lidos, sucessos, falhas
+
+
+def run_pipeline(watch_interval: int = None, dedupe_window: int = 0):
+    """
+    Executa o fluxo completo.
+    - watch_interval=None: roda uma vez e encerra.
+    - watch_interval>0: roda em loop, aguardando 'watch_interval' segundos entre ciclos.
+    - dedupe_window: janela em minutos para evitar reinserir IdAdimission recentes.
+    """
+    init_oracle_client()
+    ciclo = 0
+    while True:
+        ciclo += 1
+        logger.info("--- Ciclo %s iniciado ---", ciclo)
+        lidos, ok, falha = processar_batch(dedupe_window=dedupe_window)
+        logger.info("Registros encontrados: %s | Inseridos: %s | Falhas: %s", lidos, ok, falha)
+        if not watch_interval:
+            break
+        logger.info("Próximo ciclo em %s segundos", watch_interval)
+        time.sleep(watch_interval)
+    logger.info("Pipeline concluído")
 
 
 # --------------------------------------------------------------------------------------
 # Entrada principal
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
-    run_pipeline()
+    # Configuração autônoma: executa a cada 1 hora (3600 segundos)
+    # com janela de deduplicação de 1 hora (60 minutos)
+    WATCH_INTERVAL_SECONDS = 3600  # 1 hora
+    DEDUPE_WINDOW_MINUTES = 60     # 1 hora
+    
+    logger.info("="*60)
+    logger.info("Robô Portal Família - Iniciando modo autônomo")
+    logger.info("Intervalo entre ciclos: 1 hora | Janela de deduplicação: 1 hora")
+    logger.info("="*60)
+    
+    run_pipeline(watch_interval=WATCH_INTERVAL_SECONDS, dedupe_window=DEDUPE_WINDOW_MINUTES)
