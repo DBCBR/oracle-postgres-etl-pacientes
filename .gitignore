@@ -28,3 +28,6 @@ instantclient/
 settings/**/instantclient_*/
 settings/**/instantclient*
 settings/linux/*.zip
+
+# Vscode settings
+.vscode/

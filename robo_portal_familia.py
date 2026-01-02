@@ -147,14 +147,13 @@ def gerar_senha_e_hash(cpf: str) -> Tuple[str, str]:
 def oracle_connect():
     """
     Abre conexão Oracle em modo thick com parâmetros explícitos (host/port/service_name).
-    Evita dependência de DSN externo e mantém a chamada tão simples quanto a do Postgres.
     """
     return oracledb.connect(
         user=ORACLE_USER,
         password=ORACLE_PASS,
         host=ORACLE_HOST,
         port=int(ORACLE_PORT) if ORACLE_PORT else None,
-        service_name=ORACLE_SERVICE,
+        service_name=ORACLE_SERVICE
     )
 
 
@@ -162,7 +161,13 @@ def postgres_connect():
     """
     Abre conexão Postgres simples.
     """
-    return psycopg2.connect(host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASS)
+    return psycopg2.connect(
+        host=PG_HOST, 
+        port=PG_PORT, 
+        dbname=PG_DB, 
+        user=PG_USER, 
+        password=PG_PASS
+    )
 
 
 def buscar_ids_recentes_postgres(janela_minutos: int) -> Set[str]:
