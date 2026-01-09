@@ -17,6 +17,7 @@ import base64
 import re
 import uuid
 import logging
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Set
@@ -150,31 +151,6 @@ def postgres_connect():
     )
 
 
-def buscar_chaves_existentes_postgres() -> Set[Tuple[str, str]]:
-    """
-    Obtém um conjunto de tuplas (IdAdimission, PatientType) que JÁ existem no Postgres.
-    Isso permite diferenciar '100 - Medico' de '100 - Enfermeiro'.
-    """
-    try:
-        if PG_SCHEMA:
-            table_name = f"{PG_SCHEMA}.\"{PG_TABLE}\""
-        else:
-            table_name = f'"{PG_TABLE}"'
-        
-        # Selecionamos as colunas que formam a nossa "chave composta lógica"
-        sql = f"SELECT \"IdAdimission\", \"PatientType\" FROM {table_name};"
-        
-        with postgres_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-                # Retorna um SET de tuplas para busca rápida O(1)
-                # row[0] = IdAdimission, row[1] = PatientType
-                return {(str(row[0]), str(row[1])) for row in cur.fetchall() if row[0] is not None}
-    except Exception as exc:
-        logger.error("Falha ao buscar chaves existentes no Postgres: %s", exc)
-        return set()
-
-
 # --------------------------------------------------------------------------------------
 # Extração e transformação
 # --------------------------------------------------------------------------------------
@@ -277,6 +253,10 @@ COLS = [
 
 
 def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
+    """
+    Insere registros no Postgres. Assume que os registros já foram validados
+    e não contêm duplicatas (validação feita em processar_batch).
+    """
     if not records:
         return 0, 0
 
@@ -297,15 +277,46 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
         with conn.cursor() as cur:
             for rec in records:
                 values = [rec.get(c) for c in COLS]
+                
                 try:
                     cur.execute(sql, values)
                     sucessos += 1
+                    logger.info(f"Inserido com sucesso | IdAdimission={rec.get('IdAdimission')} | CPF={rec.get('UserCpf')}")
+                    
+                    
                 except Exception as exc:
                     falhas += 1
-                    logger.error("Falha ao inserir - IdAdimission=%s | Tipo=%s | Erro: %s", 
-                                 rec.get("IdAdimission"), rec.get("PatientType"), exc)
+                    logger.error("Falha ao inserir - IdAdimission=%s | CPF=%s | Erro: %s", 
+                                 rec.get("IdAdimission"), rec.get("UserCpf"), exc)
 
     return sucessos, falhas
+
+
+# --------------------------------------------------------------------------------------
+# Validação de CPF no Postgres
+# --------------------------------------------------------------------------------------
+def cpf_ja_existe_postgres(cpf: str) -> bool:
+    """
+    Verifica se um CPF já existe registrado no Postgres.
+    """
+    if not cpf:
+        return False
+    
+    if PG_SCHEMA:
+        table_name = f"{PG_SCHEMA}.\"{PG_TABLE}\""
+    else:
+        table_name = f"\"{PG_TABLE}\""
+    
+    sql = f'SELECT 1 FROM {table_name} WHERE "UserCpf" = %s LIMIT 1;'
+    
+    try:
+        with postgres_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (cpf,))
+                return cur.fetchone() is not None
+    except Exception as exc:
+        logger.error(f"Erro ao verificar CPF no Postgres: {exc}")
+        return False
 
 
 # --------------------------------------------------------------------------------------
@@ -313,48 +324,30 @@ def inserir_postgres(records: List[Dict]) -> Tuple[int, int]:
 # --------------------------------------------------------------------------------------
 def processar_batch() -> Tuple[int, int, int]:
     """
-    Fluxo otimizado:
-    1. Busca histórico (ID + PatientType) do Postgres.
-    2. Lê Oracle.
-    3. Filtra o que já existe no histórico.
-    4. Insere somente novos.
+    Fluxo otimizado com validação por CPF:
+    1. Lê registros do Oracle.
+    2. Verifica se o CPF já existe no Postgres.
+    3. Se não existir, inclui o registro para inserção.
+    4. Insere somente registros com CPF não duplicado.
     """
-    # 1. Carrega histórico existente para evitar duplicidade de processamento
-    chaves_existentes = buscar_chaves_existentes_postgres()
-    logger.info(f"Registros já persistidos no Postgres (Histórico): {len(chaves_existentes)}")
 
     registros_novos = []
     total_lidos_oracle = 0
-    ignorados_historico = 0
-    ignorados_batch_atual = 0
-    
-    # Controle local para não duplicar registros iguais vindos na mesma consulta do Oracle
-    chaves_vistas_agora = set()
+    ignorados_cpf_existente = 0
 
     for row in fetch_oracle_rows():
         total_lidos_oracle += 1
         try:
-            # Transformamos antes para ter acesso ao PatientType composto
+            # Transforma o registro do Oracle
             reg = transformar_registro(row)
+            cpf = reg.get("UserCpf", "")
             
-            id_adm = str(reg.get("IdAdimission"))
-            p_type = str(reg.get("PatientType"))
-            
-            # A chave de unicidade é a combinação do Atendimento com o Tipo/Profissional
-            chave_unica = (id_adm, p_type)
-
-            # VERIFICAÇÃO 1: Já está no banco?
-            if chave_unica in chaves_existentes:
-                ignorados_historico += 1
+            # Verifica se o CPF já existe no Postgres
+            if cpf_ja_existe_postgres(cpf):
+                ignorados_cpf_existente += 1
+                logger.error(f"Registro do CPF {cpf} já foi inserido no DB")
                 continue
             
-            # VERIFICAÇÃO 2: Já processei neste ciclo? (Oracle pode retornar linhas repetidas)
-            if chave_unica in chaves_vistas_agora:
-                ignorados_batch_atual += 1
-                continue
-
-            # Se é novo, adiciona à lista e marca como visto
-            chaves_vistas_agora.add(chave_unica)
             registros_novos.append(reg)
 
         except Exception as exc:
@@ -362,8 +355,7 @@ def processar_batch() -> Tuple[int, int, int]:
 
     logger.info(
         f"Lidos Oracle: {total_lidos_oracle} | "
-        f"Ignorados (Já no Banco): {ignorados_historico} | "
-        f"Ignorados (Duplicados na View): {ignorados_batch_atual} | "
+        f"Ignorados (CPF já registrado): {ignorados_cpf_existente} | "
         f"Novos a inserir: {len(registros_novos)}"
     )
 
@@ -401,3 +393,4 @@ if __name__ == "__main__":
     logger.info("="*60)
     
     run_pipeline(watch_interval=WATCH_INTERVAL_SECONDS)
+    
