@@ -1,6 +1,6 @@
 # Robô Portal Família
 
-Sistema automatizado de sincronização de dados de pacientes entre Oracle (hospital) e Postgres (Portal da Família).
+Sistema automatizado de sincronização de dados de pacientes entre Oracle e Postgres.
 
 ---
 
@@ -8,7 +8,7 @@ Sistema automatizado de sincronização de dados de pacientes entre Oracle (hosp
 
 ### O que este programa faz?
 
-Este programa é um "robô" automático que copia informações de pacientes de um banco de dados Oracle (usado pelo hospital) para outro banco de dados Postgres (usado pelo Portal da Família). Ele funciona como uma ponte entre dois sistemas.
+Este programa é um "robô" automático que copia informações de pacientes de um banco de dados Oracle para outro banco de dados Postgres. Ele funciona como uma ponte entre dois sistemas.
 
 ### Como funciona passo a passo?
 
